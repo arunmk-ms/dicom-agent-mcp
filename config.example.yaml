@@ -1,0 +1,41 @@
+# Optional dicom-agent-mcp configuration for advanced settings. Most setups need no file:
+# pass --node, --storage-dir and --allow-path as arguments instead (see README).
+# To use this file, copy it to dicom-agent-mcp.yaml (auto-loaded from the working directory) or pass --config.
+# Relative paths are resolved against this file's directory.
+
+calling_ae_title: DICOM_MCP     # AE title this server uses; register it on your PACS for C-FIND/C-GET/C-MOVE.
+storage_dir: ./dicom-cache      # Local cache for retrieved instances. Keep it out of source control.
+allowed_paths: []               # Extra directories the store/read_local_metadata tools may read.
+max_results: 500                # Upper bound for search/get_metadata limits.
+max_volume_voxels: 100000000    # render_mpr refuses larger series.
+deid_key_env: DICOM_AGENT_MCP_DEID_KEY  # Env var holding the secret for stable pseudonyms; never put the key here.
+
+timeouts:                       # Seconds.
+  acse: 30
+  dimse: 60
+  network: 60
+  http: 60
+
+nodes:
+  orthanc:
+    protocol: dimse
+    description: Local Orthanc over DIMSE (see docker-compose.yml)
+    host: localhost
+    port: 4242
+    ae_title: ORTHANC
+
+  orthanc-web:
+    protocol: dicomweb
+    description: Local Orthanc over DICOMweb
+    base_url: http://localhost:8042/dicom-web
+
+  # Azure Health Data Services DICOM service. Put an Entra access token in AZURE_DICOM_TOKEN, e.g.
+  #   $env:AZURE_DICOM_TOKEN = az account get-access-token --resource https://dicom.healthcareapis.azure.com --query accessToken -o tsv
+  azure-dicom:
+    protocol: dicomweb
+    description: Azure DICOM service (read-only)
+    base_url: https://<workspace>-<service>.dicom.azurehealthcareapis.com/v2
+    auth:
+      type: bearer
+      token_env: AZURE_DICOM_TOKEN
+    read_only: true

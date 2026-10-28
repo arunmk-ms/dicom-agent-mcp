@@ -1,0 +1,15 @@
+{
+	"servers": {
+		"dicom": {
+			"type": "stdio",
+			"command": "${workspaceFolder}/.venv/Scripts/dicom-agent-mcp",
+			"args": [
+				"--node", "orthanc=dimse://ORTHANC@localhost:4242",
+				"--node", "orthanc-web=http://localhost:8042/dicom-web",
+				"--node", "azure-dicom=https://<workspace>-<service>.dicom.azurehealthcareapis.com/v2;token-env=AZURE_DICOM_TOKEN;read-only",
+				"--storage-dir", "${workspaceFolder}/dicom-cache"
+			]
+		}
+	},
+	"inputs": []
+}

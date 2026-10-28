@@ -1,0 +1,24 @@
+# Python environments and generated artifacts
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# Local medical data
+dicom-cache/
+inbox/
+*.dcm
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+dicom-agent-mcp.yaml
+config.yaml

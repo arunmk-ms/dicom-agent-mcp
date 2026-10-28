@@ -1,0 +1,20 @@
+# Local Orthanc test archive with DICOMweb enabled. Test data only.
+# DIMSE: localhost:4242 (AE ORTHANC), DICOMweb: http://localhost:8042/dicom-web
+services:
+  orthanc:
+    image: orthancteam/orthanc:latest
+    ports:
+      - "4242:4242"
+      - "8042:8042"
+    environment:
+      ORTHANC__NAME: dicom-agent-mcp-test
+      ORTHANC__AUTHENTICATION_ENABLED: "false"
+      ORTHANC__DICOM_AET: ORTHANC
+      ORTHANC__DICOM_CHECK_CALLED_AE_TITLE: "false"
+      DICOM_WEB_PLUGIN_ENABLED: "true"
+      # Lets Orthanc accept C-FIND/C-GET/C-MOVE from the MCP server's AE title.
+      ORTHANC__DICOM_MODALITIES: |
+        {"mcp": ["DICOM_MCP", "host.docker.internal", 11112]}
+      ORTHANC__DICOM_ALWAYS_ALLOW_FIND: "true"
+      ORTHANC__DICOM_ALWAYS_ALLOW_GET: "true"
+      ORTHANC__DICOM_ALWAYS_ALLOW_STORE: "true"
