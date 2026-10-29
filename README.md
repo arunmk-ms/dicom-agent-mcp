@@ -1,8 +1,10 @@
 # dicom-agent-mcp
 
+<!-- mcp-name: io.github.arunmk-ms/dicom-agent-mcp -->
+
 An MCP (Model Context Protocol) server that gives AI agents one set of tools for both **DIMSE** archives (C-ECHO, C-FIND, C-GET, C-MOVE, C-STORE) and **DICOMweb** archives (QIDO-RS, WADO-RS, STOW-RS).
 
-It also includes pixel and geometry tools that work on local files: rendering, statistics, measurement, geometry checks, multiplanar reconstruction (MPR) and de-identification. This is the tool layer for Topic 3 (Validated Tool Execution). The verification loop comes later; see [Roadmap](#roadmap).
+It also includes pixel and geometry tools that work on local files: rendering, statistics, measurement, geometry checks, multiplanar reconstruction (MPR) and de-identification. This is the tool layer for Topic 3 (Validated Tool Execution). The verification loop comes later; see [ROADMAP.md](ROADMAP.md).
 
 > **Not for clinical use.** This is a research scaffold. Use only with test or de-identified data.
 
@@ -157,7 +159,7 @@ Use absolute paths here: these harnesses may start the server in any working dir
 ### Local Orthanc for testing
 
 ```powershell
-docker compose up -d   # DIMSE on 4242, DICOMweb on http://localhost:8042/dicom-web (compose file not yet tested)
+docker-compose up -d   # DIMSE on 4242, DICOMweb on http://localhost:8042/dicom-web (compose file not yet tested)
 ```
 
 ## Sample prompts
@@ -292,45 +294,4 @@ The tests run end to end against an in-process pynetdicom PACS (two AEs so C-MOV
 
 ## Roadmap
 
-### Done
-
-- **Protocol layer:** DIMSE (C-ECHO, C-FIND, C-GET, C-MOVE, C-STORE) and DICOMweb (QIDO-RS, WADO-RS, STOW-RS) behind one set of tools, with a path sandbox, `read_only` nodes and result caps.
-- **Pixel and geometry tools:** `render_image`, `pixel_statistics`, `measure_distance`, `check_geometry`, `render_mpr` and `deidentify`, each returning an `input_fingerprint`.
-
-### Pending, in recommended order
-
-1. **Verification loop (TEVL), the core of Topic 3.** It builds on the fingerprint and geometry checks that already exist.
-   - A contract for each tool: preconditions on its inputs and postconditions on its outputs.
-   - Each tool result must echo the input fingerprint, so results stay bound to their inputs.
-   - Verifiers built from the `check_geometry` issue codes.
-   - PASS / SOFT_FAIL / HARD_FAIL verdicts, recorded in the SR before `store` or `transfer` commits anything.
-2. **Output objects.** Writing DICOM SEG (segmentations), SR TID 1500 (measurement reports) and Secondary Capture. Verification verdicts are stored in the SR.
-3. **Hardening.**
-   - Test against a real Orthanc server (`docker-compose.yml` has not been run yet) and the Azure DICOM service.
-   - TLS for DIMSE.
-   - Let `retrieve` fall back to C-MOVE for archives without C-GET.
-   - Stream large STOW-RS and WADO-RS transfers instead of holding them in memory.
-   - Publish to PyPI and the MCP registry.
-4. **Pixel and geometry leftovers.**
-   - Resample volumes to isotropic voxels, and support oblique MPR.
-   - Test compressed transfer syntaxes (`[codecs]`), enhanced multi-frame objects and real-world data.
-5. **Adoption.**
-   - Self-provisioning: expose tools according to the configured nodes and available data, and announce changes with `notifications/tools/list_changed`.
-   - A plugin SDK for third-party tools.
-   - Demos in several harnesses.
-   - A benchmark.
-
-### Backlog (other features worth adding)
-
-| Area | Ideas |
-|---|---|
-| Workflow standards | Modality Worklist query, MPPS (procedure status), Storage Commitment, UPS-RS work items |
-| DICOMweb extras | Server-side rendered images and single frames, thumbnails, Azure change feed and extended query tags |
-| Pixel analysis | PET standardised uptake values (SUV), comparison with the patient's earlier studies, HU checks against a calibration phantom |
-| AI integrations | Segmentation with TotalSegmentator or MONAI, written as SEG with measurements in SR |
-| Conversion | Export to NIfTI or NRRD, transcoding between transfer syntaxes, reading RTSTRUCT and SEG back in |
-| Viewing context | Saved display settings (GSPS presentation states), key-image notes (KOS), overlays |
-| Conformance checking | Check that objects have the attributes their type requires (like `dciodvfy`) and that character sets are correct |
-| Privacy | Detect and black out burned-in text (OCR), full Basic Profile options, a de-identification audit trail |
-| More MCP features | Studies as MCP resources, ready-made prompts such as "chest CT review", user confirmation before writes |
-| Operations | HTTP transport with OAuth, audit logging (ATNA/syslog), rate limits, OpenTelemetry tracing |
+See [ROADMAP.md](ROADMAP.md).

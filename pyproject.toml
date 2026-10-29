@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling>=1.24"]
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
@@ -8,7 +8,20 @@ version = "0.1.0"
 description = "MCP server that gives AI agents protocol-neutral DICOM tools (DIMSE and DICOMweb)."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "Apache-2.0" }
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "arunmk-ms" }]
+keywords = ["mcp", "model-context-protocol", "dicom", "dicomweb", "pacs", "medical-imaging", "ai-agents"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Healthcare Industry",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Scientific/Engineering :: Medical Science Apps.",
+]
 dependencies = [
     "mcp>=1.9,<2",
     "pydicom>=3.0",
@@ -28,8 +41,17 @@ codecs = ["pylibjpeg>=2", "pylibjpeg-libjpeg>=2", "pylibjpeg-openjpeg>=2", "pyli
 [project.scripts]
 dicom-agent-mcp = "dicom_agent_mcp.server:main"
 
+[project.urls]
+Homepage = "https://github.com/arunmk-ms/dicom-agent-mcp"
+Repository = "https://github.com/arunmk-ms/dicom-agent-mcp"
+Issues = "https://github.com/arunmk-ms/dicom-agent-mcp/issues"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/dicom_agent_mcp"]
+
+# Keep the source distribution to code, tests and docs; never ship local config, caches or images.
+[tool.hatch.build.targets.sdist]
+include = ["src", "tests", "README.md", "ROADMAP.md", "LICENSE", "config.example.yaml", "server.json", "pyproject.toml"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

@@ -1,0 +1,69 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.arunmk-ms/dicom-agent-mcp",
+  "title": "DICOM Agent",
+  "description": "Search, retrieve, store, view, measure and de-identify DICOM images over DIMSE and DICOMweb.",
+  "repository": {
+    "url": "https://github.com/arunmk-ms/dicom-agent-mcp",
+    "source": "github"
+  },
+  "websiteUrl": "https://github.com/arunmk-ms/dicom-agent-mcp",
+  "version": "0.1.0",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "registryBaseUrl": "https://pypi.org",
+      "identifier": "dicom-agent-mcp",
+      "version": "0.1.0",
+      "runtimeHint": "uvx",
+      "transport": {
+        "type": "stdio"
+      },
+      "packageArguments": [
+        {
+          "type": "named",
+          "name": "--node",
+          "description": "DICOM node: name=dimse://AE_TITLE@host:port or name=https://server/dicom-web, with optional ;read-only ;token-env=VAR ;user=NAME;password-env=VAR. Repeatable.",
+          "isRepeated": true,
+          "format": "string",
+          "placeholder": "orthanc=dimse://ORTHANC@localhost:4242"
+        },
+        {
+          "type": "named",
+          "name": "--storage-dir",
+          "description": "Local cache for retrieved files and renders. Defaults to ~/.dicom-agent-mcp/cache.",
+          "format": "filepath"
+        },
+        {
+          "type": "named",
+          "name": "--allow-path",
+          "description": "Extra directory the local-file and pixel tools may read. Repeatable.",
+          "isRepeated": true,
+          "format": "filepath"
+        },
+        {
+          "type": "named",
+          "name": "--calling-ae",
+          "description": "AE title this server uses for DIMSE. Defaults to DICOM_MCP.",
+          "format": "string"
+        }
+      ],
+      "environmentVariables": [
+        {
+          "name": "AZURE_DICOM_TOKEN",
+          "description": "Bearer token for a DICOMweb node configured with token-env=AZURE_DICOM_TOKEN. Use any variable name you reference in --node.",
+          "isRequired": false,
+          "isSecret": true,
+          "format": "string"
+        },
+        {
+          "name": "DICOM_AGENT_MCP_DEID_KEY",
+          "description": "Secret that makes de-identification pseudonyms and UIDs consistent across calls.",
+          "isRequired": false,
+          "isSecret": true,
+          "format": "string"
+        }
+      ]
+    }
+  ]
+}
