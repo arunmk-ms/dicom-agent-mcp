@@ -4,11 +4,10 @@
 
 | Area | Ideas |
 |---|---|
-| Verification loop (TEVL) | Each tool gets a contract: preconditions on its inputs and postconditions on its outputs. Each tool result echoes `input_fingerprint`. Verifiers are built from the `check_geometry` issue codes. PASS / SOFT_FAIL / HARD_FAIL verdicts are recorded in the SR before `store` or `transfer` commits anything |
+| Verification loop (TEVL), next steps | Contracts, the hash-chained JSONL ledger, the store gate, `verify_claim` and explicit result states are done (see README). Still to do: write verdicts as DICOM SR objects that travel with the data, contracts for `search`/`get_metadata` content, and signing of the ledger |
 | Output objects | Write DICOM SEG (segmentations), SR TID 1500 (measurement reports, including verification verdicts) and Secondary Capture |
 | Real-world testing | Run against a real Orthanc server (`docker-compose.yml`) and the Azure DICOM service |
 | Protocol hardening | TLS for DIMSE, C-MOVE fallback in `retrieve` for archives without C-GET, streaming of large STOW-RS and WADO-RS transfers |
-| Explicit result states | `search`, `retrieve`, `move` and `transfer` return a `status` of `ok`, `empty`, `partial`, `truncated` or `failed`, so an agent never mistakes a silent empty result for "nothing found". `empty` echoes the applied filters and query level (and flags levels or keys the archive does not support). `partial` lists the failed items, not just counts. A retrieve that returns zero files is flagged. In the verification loop, `empty` and `partial` are SOFT_FAIL rather than silent success |
 | Pixel and geometry | Isotropic resampling and oblique MPR. Test compressed transfer syntaxes (`[codecs]`), enhanced multi-frame objects and real-world data |
 | Pixel analysis | PET standardised uptake values (SUV), comparison with the patient's earlier studies, HU checks against a calibration phantom |
 | Adoption | Self-provisioning: expose tools based on the configured nodes and available data, and send `notifications/tools/list_changed`. A plugin SDK for third-party tools, demos in several harnesses, a benchmark |

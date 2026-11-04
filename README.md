@@ -34,7 +34,16 @@ It also includes pixel and geometry tools that work on local files: rendering, s
 | `render_mpr` | Renders an axial, coronal or sagittal slice reformatted from a series that passes `check_geometry`. The PNG uses true mm aspect and radiological orientation |
 | `deidentify` | Writes de-identified copies under `storage_dir/deidentified` using a subset of the Basic Profile. See [De-identification](#de-identification) |
 
-Every pixel result includes an `input_fingerprint`: a SHA-256 hash of the decoded pixels and geometry. It does not change with the transfer syntax, and the planned verification loop will use it to bind results to their inputs.
+Every pixel result includes an `input_fingerprint`: a SHA-256 hash of the decoded pixels and geometry. It does not change with the transfer syntax, and the verification loop uses it to bind results to their inputs.
+
+### Verification tools
+
+| Tool | What it does |
+|---|---|
+| `verify_claim` | Re-runs `pixel_statistics`, `measure_distance` or `check_geometry` and compares the values the agent intends to report (for example `{"mean": 47.2}`) with the fresh result. It returns a verdict for each field. The default tolerance is half a unit in the last decimal of the claimed value |
+| `get_verification` | Looks up ledger records by id or by fingerprint, and checks the integrity of the hash chain |
+
+See [Verification loop](#verification-loop-tevl).
 
 Each tool carries MCP annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`) so a harness can decide which tools need approval.
 
@@ -59,6 +68,7 @@ No config file is needed. Pass nodes and paths as arguments in the harness confi
 | `--storage-dir DIR` | Local cache for retrieved files and renders. Default `~/.dicom-agent-mcp/cache` |
 | `--allow-path DIR` | Extra directory that the local-file and pixel tools may read. Repeatable |
 | `--calling-ae AE` | AE title this server uses for DIMSE. Default `DICOM_MCP`; register it on your PACS |
+| `--verification MODE` | `off`, `advisory` (default) or `enforce`. See [Verification loop](#verification-loop-tevl) |
 | `--config FILE` | Optional YAML file (see below) |
 | `--print-config` | Prints the resolved settings and exits. Useful for checking a harness setup |
 
@@ -99,6 +109,7 @@ Every argument has an environment-variable equivalent, which suits Docker and CI
 | `DICOM_AGENT_MCP_STORAGE_DIR` | `--storage-dir` |
 | `DICOM_AGENT_MCP_ALLOWED_PATHS` | `--allow-path`; several paths separated by `;` on Windows or `:` elsewhere |
 | `DICOM_AGENT_MCP_CALLING_AE` | `--calling-ae` |
+| `DICOM_AGENT_MCP_VERIFICATION` | `--verification` |
 | `DICOM_AGENT_MCP_CONFIG` | `--config` |
 
 ### Optional YAML file (advanced)
@@ -230,6 +241,8 @@ The tool the agent is expected to call is shown after each prompt.
 - "Find the latest CT for patient MRN123 on `orthanc`, download it, check its geometry, and show me an axial and a coronal view in a soft-tissue window."
 - "Measure the mean HU of the liver at slice 60 (a 15 mm circle at row 300, column 180) and report the input fingerprint."
 - "Download study X from `orthanc`, de-identify it, and upload the de-identified copy to `azure-dicom`."
+- "Measure the mean HU in that ROI, then verify the number before you report it." (`pixel_statistics`, then `verify_claim`)
+- "Show me the verification record for that measurement and confirm the ledger is intact." (`get_verification`)
 
 ### Prompts the server should refuse
 
@@ -238,6 +251,41 @@ The tool the agent is expected to call is shown after each prompt.
 | "Store these files to `<a node marked read_only>`." | Refused because the node is read-only |
 | "Read `C:\Windows\System32\config`." | Refused because the path is outside the sandbox |
 | "Render a coronal MPR of a series that has missing slices." | Refused, with the geometry issues listed |
+| "Upload this series with a missing slice to `orthanc`." (with `--verification enforce`) | Blocked by the store gate until the call passes `accept_soft_fail` |
+| "Upload the de-identified copy whose verdict was HARD_FAIL." (with `--verification enforce`) | Blocked with `PRIOR_HARD_FAIL` |
+
+## Verification loop (TEVL)
+
+TEVL stands for Tool Execution Verification Loop. Each tool has a contract: preconditions on its inputs and postconditions on its outputs. Every check produces a verdict:
+
+- `PASS`: the check succeeded.
+- `SOFT_FAIL`: the result can be used, but it needs a caveat. Examples are a clipped ROI, a preset applied to non-HU data, a missing slice in data about to be stored, an empty search, or a partial transfer.
+- `HARD_FAIL`: the result is wrong or unsafe. Examples are statistics that are inconsistent with each other, an aspect ratio that does not match the mm spacing, identifiers left after de-identification, or an MPR of a series that has gaps.
+
+The result of each verified tool includes a `verification` block with the record `id`, the overall `verdict`, the policy and the individual checks. The geometry verifiers reuse the `check_geometry` issue codes.
+
+**Ledger.** Each verdict is appended to `storage_dir/verification/ledger.jsonl`. Every record holds the SHA-256 of the previous record, so editing or deleting a line breaks the chain, and `get_verification` reports where. Records bind results to their inputs through the input fingerprints, to their outputs through a digest of the result, and to files through their SHA-256.
+
+**Store gate.** Before `store` (or the store step of `transfer`) sends anything, it runs a gate and writes the gate record first. The gate checks for:
+
+- duplicate SOP Instance UIDs;
+- more than one patient in a batch;
+- the geometry of each series;
+- the most recent ledger verdict for each file, for example the `deidentify` run that produced it.
+
+The commit record refers back to the gate record.
+
+**Policy** (`--verification` or `verification:` in YAML):
+
+| Mode | Behaviour |
+|---|---|
+| `off` | No checks and no ledger |
+| `advisory` (default) | Verdicts are recorded and returned, and nothing is blocked |
+| `enforce` | `HARD_FAIL` blocks the tool. A `SOFT_FAIL` at the store gate blocks the commit unless the call passes `accept_soft_fail: true` |
+
+**Result states.** `search`, `retrieve`, `move`, `store` and `transfer` return a `status` of `ok`, `empty`, `partial`, `truncated` or `failed`. The protocol's own status text is kept in `protocol_status`. An empty search echoes the query and flags filter keys the archive may not support. Partial results list the failed items in `failed_items`. A `transfer` that retrieves nothing returns `empty` instead of storing nothing.
+
+Verification records are not yet written as DICOM SR objects; see [ROADMAP.md](ROADMAP.md).
 
 ## Safety
 
@@ -271,7 +319,9 @@ server.py  (FastMCP tools)  →  service.py  (routing, sandbox, paging)
                                    ├── dimse.py     (pynetdicom SCU)
                                    ├── dicomweb.py  (httpx QIDO/WADO/STOW)
                                    ├── imaging.py   (windowing, geometry, ROI stats, MPR, fingerprints)
-                                   └── deid.py      (Basic Profile subset)
+                                   ├── deid.py      (Basic Profile subset)
+                                   ├── contracts.py (TEVL pre/postconditions, store gate, claim comparison)
+                                   └── verification.py (verdicts, policy, hash-chained ledger)
 ```
 
 ## Tests

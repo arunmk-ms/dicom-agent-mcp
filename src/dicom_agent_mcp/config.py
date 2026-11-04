@@ -70,9 +70,17 @@ class Settings(BaseModel):
         description="Environment variable with the secret that makes pseudonyms and UIDs consistent across calls.",
     )
     nodes: dict[str, Node] = Field(default_factory=dict)
+    verification: Literal["off", "advisory", "enforce"] = Field(
+        "advisory",
+        description="TEVL policy: off; advisory (record and report verdicts); enforce (block HARD_FAIL, and SOFT_FAIL on store/transfer).",
+    )
 
     def readable_roots(self) -> list[Path]:
         return [self.storage_dir.resolve(), *(p.resolve() for p in self.allowed_paths)]
+
+    @property
+    def ledger_path(self) -> Path:
+        return self.storage_dir / "verification" / "ledger.jsonl"
 
 
 ENV_PREFIX = "DICOM_AGENT_MCP_"
@@ -134,6 +142,7 @@ def build_settings(
     storage_dir: str | None = None,
     allowed_paths: Iterable[str] = (),
     calling_ae_title: str | None = None,
+    verification: str | None = None,
     environ: Mapping[str, str] | None = None,
     cwd: Path | None = None,
 ) -> Settings:
@@ -176,6 +185,9 @@ def build_settings(
         for spec in source_nodes:
             name, node = parse_node(spec)
             raw["nodes"][name] = node
+    for source_policy in (env.get(f"{ENV_PREFIX}VERIFICATION"), verification):
+        if source_policy:
+            raw["verification"] = source_policy.strip().lower()
     return Settings.model_validate(raw)
 
 

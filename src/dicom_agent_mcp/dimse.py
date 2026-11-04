@@ -136,14 +136,15 @@ class DimseClient:
         ae = self._ae()
         ae.add_requested_context(model)
         final: Dataset | None = None
+        final_ident: Dataset | None = None
         with self._associate(ae) as assoc:
-            for status, _ in assoc.send_c_move(identifier, destination_aet, model):
+            for status, ident in assoc.send_c_move(identifier, destination_aet, model):
                 if not status:
                     raise DicomMcpError(f"C-MOVE on '{self.name}' timed out or the association was aborted.")
-                final = status
+                final, final_ident = status, ident
                 if status.Status not in PENDING:
                     break
-        return {"operation": "C-MOVE", "destination_ae_title": destination_aet, **_suboperations(final)}
+        return {"operation": "C-MOVE", "destination_ae_title": destination_aet, **_suboperations(final, final_ident)}
 
     def get(self, level: Level, identifier: Dataset, dest: Path) -> dict[str, Any]:
         """C-GET: the archive sends the matching instances back over the same association."""
@@ -173,14 +174,15 @@ class DimseClient:
                 return 0xA700
 
         final: Dataset | None = None
+        final_ident: Dataset | None = None
         with self._associate(ae, ext_neg=roles, evt_handlers=[(evt.EVT_C_STORE, on_store)]) as assoc:
-            for status, _ in assoc.send_c_get(identifier, model):
+            for status, ident in assoc.send_c_get(identifier, model):
                 if not status:
                     raise DicomMcpError(f"C-GET on '{self.name}' timed out or the association was aborted.")
-                final = status
+                final, final_ident = status, ident
                 if status.Status not in PENDING:
                     break
-        return {"operation": "C-GET", "files": files, "save_errors": errors, **_suboperations(final)}
+        return {"operation": "C-GET", "files": files, "save_errors": errors, **_suboperations(final, final_ident)}
 
     def store(self, paths: list[Path]) -> dict[str, Any]:
         headers = [(p, dcmread(p, stop_before_pixels=True)) for p in paths]
@@ -217,13 +219,17 @@ class DimseClient:
         return {"operation": "C-STORE", "stored": stored, "failed": len(results) - stored, "results": results}
 
 
-def _suboperations(status: Dataset | None) -> dict[str, Any]:
+def _suboperations(status: Dataset | None, identifier: Dataset | None = None) -> dict[str, Any]:
     if status is None:
         return {"ok": False, "status": "no response"}
-    return {
+    out: dict[str, Any] = {
         "ok": status.Status == 0x0000,
         "status": _status_text(status.Status),
         "completed": int(status.get("NumberOfCompletedSuboperations", 0) or 0),
         "failed": int(status.get("NumberOfFailedSuboperations", 0) or 0),
         "warning": int(status.get("NumberOfWarningSuboperations", 0) or 0),
     }
+    failed_uids = identifier.get("FailedSOPInstanceUIDList") if identifier is not None else None
+    if failed_uids:
+        out["failed_sop_instance_uids"] = [str(failed_uids)] if isinstance(failed_uids, str) else [str(u) for u in failed_uids]
+    return out

@@ -32,6 +32,13 @@ For pixels: run check_geometry on a retrieved series before measuring or reconst
 or render_mpr to look at images, pixel_statistics for HU/ROI values, measure_distance for mm distances
 (pixel coordinates are [row, column] from the top-left), and deidentify before sharing data.
 Results include an input_fingerprint of the exact pixels used; quote it when reporting findings.
+Verification (TEVL): tool results carry a verification block with a verdict (PASS, SOFT_FAIL or HARD_FAIL),
+the checks behind it and a ledger record id. Treat HARD_FAIL results as wrong, and mention SOFT_FAIL
+caveats when you report. Before reporting a number, you can call verify_claim to recompute it
+independently. search, retrieve, move, store and transfer return a status (ok, empty, partial,
+truncated, failed): an empty search is not proof that nothing exists. Under the enforce policy, store
+and transfer refuse on a HARD_FAIL gate verdict, and refuse a SOFT_FAIL one unless you pass
+accept_soft_fail after reviewing the checks. get_verification reads the ledger.
 """
 
 READ = ToolAnnotations(readOnlyHint=True, openWorldHint=True)
@@ -46,6 +53,10 @@ SopUid = Annotated[str | None, Field(description="SOPInstanceUID to narrow the r
 LocalFile = Annotated[str, Field(description="Path to a local DICOM file inside the allowed paths (e.g. from retrieve).")]
 LocalPaths = Annotated[list[str], Field(description="Local DICOM files or directories inside the allowed paths.")]
 Frame = Annotated[int, Field(ge=0, description="0-based frame index for multi-frame images.")]
+AcceptSoftFail = Annotated[
+    bool,
+    Field(description="Under the enforce policy, proceed although the pre-commit gate returned SOFT_FAIL. Review the gate checks first."),
+]
 MaxSize = Annotated[int, Field(ge=64, le=2048, description="Longest edge of the PNG in pixels.")]
 WindowName = Annotated[
     str,
@@ -130,9 +141,14 @@ def create_server(
     async def store(
         node: Node,
         paths: Annotated[list[str], Field(description="Local DICOM files or directories inside the allowed paths.")],
+        accept_soft_fail: AcceptSoftFail = False,
     ) -> dict[str, Any]:
-        """Send local DICOM files to a node (C-STORE or STOW-RS)."""
-        return await run(service.store, node, paths)
+        """Send local DICOM files to a node (C-STORE or STOW-RS).
+
+        A pre-commit gate checks the files first (earlier verdicts for these files, duplicate instances, mixed
+        patients within a study, series geometry) and records its verdict before anything is sent.
+        """
+        return await run(service.store, node, paths, accept_soft_fail)
 
     @mcp.tool(annotations=WRITE)
     async def transfer(
@@ -141,9 +157,13 @@ def create_server(
         study_uid: StudyUid,
         series_uid: SeriesUid = None,
         sop_instance_uid: SopUid = None,
+        accept_soft_fail: AcceptSoftFail = False,
     ) -> dict[str, Any]:
-        """Copy data between any two nodes, including DIMSE to DICOMweb, through the local cache."""
-        return await run(service.transfer, source, destination, study_uid, series_uid, sop_instance_uid)
+        """Copy data between any two nodes, including DIMSE to DICOMweb, through the local cache.
+
+        The store step passes the same pre-commit gate as the store tool.
+        """
+        return await run(service.transfer, source, destination, study_uid, series_uid, sop_instance_uid, accept_soft_fail)
 
     @mcp.tool(annotations=LOCAL_READ)
     async def list_local_files(
@@ -239,6 +259,34 @@ def create_server(
         """
         return await run(service.deidentify, paths, date_mode, keep_descriptions, keep_private)
 
+    # ---- verification ----------------------------------------------------------------------
+
+    @mcp.tool(annotations=LOCAL_READ)
+    async def verify_claim(
+        tool: Annotated[Literal["pixel_statistics", "measure_distance", "check_geometry"], Field(description="Tool whose result is claimed.")],
+        arguments: Annotated[dict[str, Any], Field(description="The arguments the claim was computed with, as passed to that tool.")],
+        claimed: Annotated[
+            dict[str, Any],
+            Field(description="Claimed result fields by dotted path, e.g. {\"mean\": 41.2, \"distance_mm\": 23.5, \"series.0.volume_ready\": true}."),
+        ],
+        input_fingerprint: Annotated[str | None, Field(description="input_fingerprint quoted with the claim; checked against the pixels now at the path.")] = None,
+        tolerance: Annotated[float | None, Field(ge=0, description="Absolute numeric tolerance. Default: half a unit in the claim's last decimal place.")] = None,
+    ) -> dict[str, Any]:
+        """Recompute a result independently and check claimed values against it before you report them.
+
+        Numbers match within the tolerance; strings and booleans must be equal. The verdict is recorded in the ledger.
+        """
+        return await run(service.verify_claim, tool, arguments, claimed, input_fingerprint, tolerance)
+
+    @mcp.tool(annotations=LOCAL_READ)
+    async def get_verification(
+        record_id: Annotated[str | None, Field(description="Ledger record id (verification.id in a tool result).")] = None,
+        fingerprint: Annotated[str | None, Field(description="Find records by pixel input_fingerprint or file sha256 digest.")] = None,
+        limit: Annotated[int, Field(ge=1, description="Maximum records to return (most recent).")] = 20,
+    ) -> dict[str, Any]:
+        """Read verification records from the hash-chained ledger and check the chain's integrity."""
+        return await run(service.get_verification, record_id, fingerprint, limit)
+
     return mcp
 
 
@@ -257,6 +305,10 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--storage-dir", help="Local cache directory (default ~/.dicom-agent-mcp/cache without a config file).")
     parser.add_argument("--allow-path", action="append", default=[], metavar="DIR", help="Extra directory the local-file tools may read. Repeatable.")
     parser.add_argument("--calling-ae", help="AE title this server uses for DIMSE (default DICOM_MCP).")
+    parser.add_argument(
+        "--verification", choices=["off", "advisory", "enforce"],
+        help=f"Verification policy (env {ENV_PREFIX}VERIFICATION, default advisory).",
+    )
     parser.add_argument("--print-config", action="store_true", help="Print the resolved settings as JSON and exit.")
     parser.add_argument("--transport", choices=["stdio", "streamable-http", "sse"], default="stdio")
     parser.add_argument("--host", default="127.0.0.1")
@@ -270,7 +322,7 @@ def main(argv: list[str] | None = None) -> None:
     try:
         settings = build_settings(
             args.config, nodes=args.node, storage_dir=args.storage_dir,
-            allowed_paths=args.allow_path, calling_ae_title=args.calling_ae,
+            allowed_paths=args.allow_path, calling_ae_title=args.calling_ae, verification=args.verification,
         )
     except (DicomMcpError, ValidationError) as exc:
         parser.error(str(exc))
