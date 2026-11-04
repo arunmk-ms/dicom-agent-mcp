@@ -8,6 +8,7 @@
 | Output objects | Write DICOM SEG (segmentations), SR TID 1500 (measurement reports, including verification verdicts) and Secondary Capture |
 | Real-world testing | Run against a real Orthanc server (`docker-compose.yml`) and the Azure DICOM service |
 | Protocol hardening | TLS for DIMSE, C-MOVE fallback in `retrieve` for archives without C-GET, streaming of large STOW-RS and WADO-RS transfers |
+| Explicit result states | `search`, `retrieve`, `move` and `transfer` return a `status` of `ok`, `empty`, `partial`, `truncated` or `failed`, so an agent never mistakes a silent empty result for "nothing found". `empty` echoes the applied filters and query level (and flags levels or keys the archive does not support). `partial` lists the failed items, not just counts. A retrieve that returns zero files is flagged. In the verification loop, `empty` and `partial` are SOFT_FAIL rather than silent success |
 | Pixel and geometry | Isotropic resampling and oblique MPR. Test compressed transfer syntaxes (`[codecs]`), enhanced multi-frame objects and real-world data |
 | Pixel analysis | PET standardised uptake values (SUV), comparison with the patient's earlier studies, HU checks against a calibration phantom |
 | Adoption | Self-provisioning: expose tools based on the configured nodes and available data, and send `notifications/tools/list_changed`. A plugin SDK for third-party tools, demos in several harnesses, a benchmark |
