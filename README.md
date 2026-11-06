@@ -266,6 +266,15 @@ The result of each verified tool includes a `verification` block with the record
 
 **Ledger.** Each verdict is appended to `storage_dir/verification/ledger.jsonl`. Every record holds the SHA-256 of the previous record, so editing or deleting a line breaks the chain, and `get_verification` reports where. Records bind results to their inputs through the input fingerprints, to their outputs through a digest of the result, and to files through their SHA-256.
 
+**Reproducibility.** Each record also stores what is needed to re-run and compare the operation:
+
+- `environment`: the versions of Python, dicom-agent-mcp, pydicom, pynetdicom, numpy, Pillow, httpx and mcp.
+- `effective_params`: the parameters the tool actually applied, after defaults were resolved. Examples are the resolved window, frame, PNG size and resampling, MPR sampling, ROI bounds, and the pixel-spacing source. For `deidentify` they include the method, the profile and its options (PS3.15 codes), the date mode, and `key_id`. `key_id` is a one-way HMAC identifier of the pseudonymisation key and never the key itself. Date offsets are not recorded.
+- `input_files`: for each input file, its SHA-256, its transfer syntax, and `produced_by`. `produced_by` is the id of the `retrieve` or `deidentify` record that wrote that file, so a measurement chains back to the de-identification and to the network fetch.
+- `source` (on `retrieve`, `move`, `store` and `transfer`): the protocol (`dimse` or `dicomweb`), the operation (C-GET, C-MOVE, C-STORE, WADO-RS or STOW-RS), the endpoint without credentials or query string, the calling AE title or requested transfer syntax, and the transfer syntaxes received or sent. This lets you compare the DIMSE and DICOMweb paths for the same study.
+
+The de-identification validation checks are written in the same record as these parameters.
+
 **Store gate.** Before `store` (or the store step of `transfer`) sends anything, it runs a gate and writes the gate record first. The gate checks for:
 
 - duplicate SOP Instance UIDs;

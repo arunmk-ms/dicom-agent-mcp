@@ -17,8 +17,11 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import platform
 import threading
 from dataclasses import dataclass, field
+from functools import lru_cache
+from importlib import metadata
 from pathlib import Path
 from typing import Any, Iterable, Literal, Mapping
 
@@ -201,6 +204,21 @@ def _record_hash(record: Mapping[str, Any]) -> str:
     return "sha256:" + hashlib.sha256(canonical_json(body).encode()).hexdigest()
 
 
+_PACKAGES = ("dicom-agent-mcp", "pydicom", "pynetdicom", "numpy", "pillow", "httpx", "mcp")
+
+
+@lru_cache(maxsize=1)
+def environment() -> dict[str, str]:
+    """Versions that determine a tool's output, recorded with every verdict so results can be reproduced."""
+    versions = {"python": platform.python_version()}
+    for name in _PACKAGES:
+        try:
+            versions[name] = metadata.version(name)
+        except metadata.PackageNotFoundError:
+            versions[name] = "not installed"
+    return versions
+
+
 # ---- running a contract --------------------------------------------------------------------------
 
 
@@ -230,7 +248,7 @@ class Verifier:
     ) -> dict[str, Any]:
         entry = {
             "tool": tool, "kind": kind, "policy": self.policy, "verdict": overall(checks),
-            "args": dict(args), "checks": [c.to_dict() for c in checks], **extra,
+            "args": dict(args), "checks": [c.to_dict() for c in checks], "environment": environment(), **extra,
         }
         return self.ledger.append(entry)
 

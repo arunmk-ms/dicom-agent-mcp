@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 from typing import Any, Callable, Mapping
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 from pydicom import dcmread
@@ -59,7 +60,7 @@ class DicomService:
         ``ctx`` is a scratch dict shared by setup/pre/run/post so inputs are read once. Results that are
         (png, info) tuples get the verification block on ``info``.
         """
-        ctx: dict[str, Any] = {}
+        ctx: dict[str, Any] = {"record": {}}
         if not self.verifier.enabled:
             if setup:
                 setup(ctx)
@@ -70,7 +71,7 @@ class DicomService:
                 setup(ctx)
             checks = list(pre(ctx)) if pre else []
             if self.verifier.blocks(overall(checks), commit=False, accept_soft_fail=False):
-                self.verifier.block(tool, args, checks, commit=False)
+                self.verifier.block(tool, args, checks, commit=False, **ctx["record"])
             result = run(ctx)
             extra: dict[str, Any] = {}
             if post:
@@ -81,14 +82,21 @@ class DicomService:
         except VerificationError:
             raise
         except DicomMcpError as exc:
-            self.verifier.record(tool, "tool", args, [*checks, Check("post", "TOOL_ERROR", HARD_FAIL, str(exc))])
+            self.verifier.record(tool, "tool", args, [*checks, Check("post", "TOOL_ERROR", HARD_FAIL, str(exc))], **ctx.get("record", {}))
             raise
         info = result[1] if isinstance(result, tuple) else result
         fingerprints = extra.pop("input_fingerprints", None)
         if fingerprints is None:
             fingerprints = [info["input_fingerprint"]] if info.get("input_fingerprint") else []
         output = digest(info, result[0] if isinstance(result, tuple) else None)
-        record = self.verifier.record(tool, "tool", args, checks, input_fingerprints=fingerprints, output_digest=output, **extra)
+        provenance: dict[str, Any] = {}
+        params = contracts.effective_params(tool, info)
+        if params is not None:
+            provenance["effective_params"] = params
+        if ctx.get("inputs"):
+            provenance["input_files"] = contracts.input_provenance(ctx["inputs"], self.verifier.ledger)
+        record = self.verifier.record(tool, "tool", args, checks, input_fingerprints=fingerprints, output_digest=output,
+                                      **provenance, **ctx.get("record", {}), **extra)
         info["verification"] = summary(record)
         return result
 
@@ -190,6 +198,22 @@ class DicomService:
         if self._node(name).read_only:
             raise DicomMcpError(f"Node '{name}' is configured as read-only.")
         return self._client(name)
+
+    _OPERATIONS = {"retrieve": ("C-GET", "WADO-RS"), "move": ("C-MOVE", None), "store": ("C-STORE", "STOW-RS")}
+
+    def _source(self, name: str, tool: str) -> dict[str, Any]:
+        """Which protocol path a network tool used, so DIMSE and DICOMweb runs can be compared from the ledger."""
+        node = self.settings.nodes.get(name)
+        if node is None:
+            return {"node": name}
+        dimse_op, web_op = self._OPERATIONS[tool]
+        if isinstance(node, DimseNode):
+            return {"node": name, "protocol": "dimse", "operation": dimse_op,
+                    "endpoint": f"{node.ae_title}@{node.host}:{node.port}", "calling_ae_title": self.settings.calling_ae_title}
+        url = urlsplit(node.base_url)
+        endpoint = urlunsplit((url.scheme, url.hostname + (f":{url.port}" if url.port else "") if url.hostname else url.netloc, url.path, "", ""))
+        return {"node": name, "protocol": "dicomweb", "operation": web_op, "endpoint": endpoint,
+                "requested_transfer_syntax": node.transfer_syntax}
 
     def list_nodes(self) -> list[dict[str, Any]]:
         out = []
@@ -311,11 +335,13 @@ class DicomService:
                 out["failed_items"] = items
             return out
 
-        def post(_: dict[str, Any], result: dict[str, Any]) -> tuple[list[Check], dict[str, Any]]:
+        def post(ctx: dict[str, Any], result: dict[str, Any]) -> tuple[list[Check], dict[str, Any]]:
             checks = contracts.retrieve_post(result, study_uid, series_uid, sop_instance_uid)
-            return checks, {"output_files": {f: file_sha256(Path(f)) for f in result["files"]}}
+            files = [Path(f) for f in result["files"]]
+            ctx["record"]["source"]["received_transfer_syntaxes"] = sorted({ts for f in files if (ts := contracts.transfer_syntax(f))})
+            return checks, {"output_files": {str(f): file_sha256(f) for f in files}}
 
-        return self._verified("retrieve", args, run, post=post)
+        return self._verified("retrieve", args, run, setup=lambda ctx: ctx["record"].update(source=self._source(node, "retrieve")), post=post)
 
     def move(
         self, node: str, destination: str, study_uid: str, series_uid: str | None = None, sop_instance_uid: str | None = None
@@ -342,7 +368,8 @@ class DicomService:
                 out["failed_items"] = [{"sop_instance_uid": u} for u in result["failed_sop_instance_uids"]]
             return out
 
-        return self._verified("move", args, run, post=lambda _, r: contracts.move_post(r))
+        return self._verified("move", args, run, setup=lambda ctx: ctx["record"].update(source={**self._source(node, "move"), "destination": destination}),
+                              post=lambda _, r: contracts.move_post(r))
 
     def store(self, node: str, paths: list[str], accept_soft_fail: bool = False) -> dict[str, Any]:
         """Send files to an archive. Under TEVL the gate verdict is written to the ledger before anything is sent."""
@@ -355,6 +382,8 @@ class DicomService:
                 raise DicomMcpError("No DICOM files found to store." + (f" Skipped: {skipped[:5]}" if skipped else ""))
             if self.verifier.enabled:
                 checks, extra = contracts.store_gate(files, self.verifier.ledger)
+                extra["source"] = {**self._source(node, "store"),
+                                   "sent_transfer_syntaxes": sorted({p["transfer_syntax"] for p in extra["input_files"].values() if p["transfer_syntax"]})}
                 verdict = overall(checks)
                 if self.verifier.blocks(verdict, commit=True, accept_soft_fail=accept_soft_fail):
                     self.verifier.block("store", args, checks, commit=True, **extra)
@@ -365,7 +394,7 @@ class DicomService:
             raise
         except DicomMcpError as exc:
             if self.verifier.enabled:
-                extra_ids = {"gate_id": gate["id"]} if gate else {}
+                extra_ids = {"gate_id": gate["id"], "source": gate["source"]} if gate else {}
                 self.verifier.record("store", "commit", args, [Check("post", "TOOL_ERROR", HARD_FAIL, str(exc))], **extra_ids)
             raise
         out: dict[str, Any] = {"node": node, "skipped": skipped, **_with_outcome(result, _outcome(result["stored"], result["failed"]))}
@@ -378,7 +407,7 @@ class DicomService:
             record = self.verifier.record(
                 "store", "commit", args, contracts.store_post(out, sent),
                 gate_id=gate["id"], gate_verdict=gate["verdict"], accepted_soft_fail=gate["accepted_soft_fail"],
-                output_digest=digest(out),
+                source=gate["source"], output_digest=digest(out),
             )
             out["verification"] = summary(record)
         return out
@@ -424,6 +453,7 @@ class DicomService:
 
         def setup(ctx: dict[str, Any]) -> None:
             ctx["file"] = self._check_file(path)
+            ctx["inputs"] = [ctx["file"]]
             ctx["ds"] = imaging.read_dataset(ctx["file"])
 
         def run(ctx: dict[str, Any]) -> tuple[bytes, dict[str, Any]]:
@@ -454,6 +484,7 @@ class DicomService:
 
         def setup(ctx: dict[str, Any]) -> None:
             ctx["file"], ctx["ds"], ctx["roi"] = self._statistics_inputs(path, roi)
+            ctx["inputs"] = [ctx["file"]]
 
         def run(ctx: dict[str, Any]) -> dict[str, Any]:
             return {"path": str(ctx["file"]), **imaging.pixel_statistics(ctx["ds"], frame, ctx["roi"])}
@@ -479,6 +510,7 @@ class DicomService:
 
         def setup(ctx: dict[str, Any]) -> None:
             ctx["file"], ctx["ds"] = self._distance_inputs(path, start, end)
+            ctx["inputs"] = [ctx["file"]]
 
         def run(ctx: dict[str, Any]) -> dict[str, Any]:
             return {"path": str(ctx["file"]), **imaging.measure_distance(ctx["ds"], (start[0], start[1]), (end[0], end[1]), frame)}
@@ -486,17 +518,17 @@ class DicomService:
         return self._verified("measure_distance", args, run, setup=setup,
                               pre=lambda ctx: contracts.distance_pre(ctx["ds"], frame), post=lambda _, r: contracts.distance_post(r))
 
-    def _geometry_raw(self, paths: list[str]) -> tuple[dict[str, Any], list[imaging.SeriesReport]]:
+    def _geometry_raw(self, paths: list[str]) -> tuple[dict[str, Any], list[imaging.SeriesReport], list[Path]]:
         files, skipped = self._collect_dicom_files(paths)
         if not files:
             raise DicomMcpError("No DICOM files found.")
         reports = [imaging.analyze_series(uid, slices) for uid, slices in imaging.group_series(files).items()]
         result = {"ok": not any(r.errors for r in reports), "series": [r.to_dict() for r in reports], "skipped": skipped}
-        return result, reports
+        return result, reports, files
 
     def check_geometry(self, paths: list[str]) -> dict[str, Any]:
         def run(ctx: dict[str, Any]) -> dict[str, Any]:
-            result, ctx["reports"] = self._geometry_raw(paths)
+            result, ctx["reports"], ctx["inputs"] = self._geometry_raw(paths)
             return result
 
         return self._verified("check_geometry", {"paths": list(paths)}, run, post=lambda ctx, _: contracts.geometry_post(ctx["reports"]))
@@ -525,7 +557,7 @@ class DicomService:
             elif len(groups) != 1:
                 raise DicomMcpError(f"The files contain {len(groups)} series; pass series_uid to pick one: {', '.join(groups)}.")
             uid, slices = next(iter(groups.items()))
-            ctx.update(uid=uid, slices=slices, report=imaging.analyze_series(uid, slices))
+            ctx.update(uid=uid, slices=slices, report=imaging.analyze_series(uid, slices), inputs=[s.path for s in slices])
 
         def run(ctx: dict[str, Any]) -> tuple[bytes, dict[str, Any]]:
             uid, slices = ctx["uid"], ctx["slices"]
@@ -560,12 +592,13 @@ class DicomService:
     ) -> dict[str, Any]:
         args = {"paths": list(paths), "date_mode": date_mode, "keep_descriptions": keep_descriptions, "keep_private": keep_private}
 
-        def run(_: dict[str, Any]) -> dict[str, Any]:
+        def run(ctx: dict[str, Any]) -> dict[str, Any]:
             if date_mode not in ("shift", "keep"):
                 raise DicomMcpError("date_mode must be 'shift' or 'keep'.")
             files, skipped = self._collect_dicom_files(paths)
             if not files:
                 raise DicomMcpError("No DICOM files found to de-identify.")
+            ctx["inputs"] = files
             key = os.environ.get(self.settings.deid_key_env)
             deidentifier = Deidentifier(key.encode() if key else None, date_mode, keep_descriptions, keep_private)  # type: ignore[arg-type]
             result = deidentify_files(files, self.settings.storage_dir / "deidentified", deidentifier)

@@ -368,3 +368,85 @@ def test_stored_files_are_unchanged_by_verification(settings):
     before = [dcmread(f).SOPInstanceUID for f in files]
     service.store("dest", files)
     assert [dcmread(f).SOPInstanceUID for f in files] == before
+
+# ---- reproducibility: environment, effective parameters, protocol path and provenance -------------
+
+
+def test_records_carry_tool_and_library_versions(local):
+    from dicom_agent_mcp import __version__
+
+    settings, inbox = local
+    service = DicomService(settings)
+    stats = service.pixel_statistics(str(inbox / "axial" / "slice000.dcm"))
+    env = service.verifier.ledger.get(stats["verification"]["id"])["environment"]
+    assert env["dicom-agent-mcp"] == __version__
+    assert {"python", "pydicom", "pynetdicom", "numpy", "pillow", "httpx"} <= set(env)
+
+
+def test_records_carry_effective_parameters(local):
+    settings, inbox = local
+    service = DicomService(settings)
+    _, info = service.render_image(str(inbox / "axial" / "slice000.dcm"))  # window="auto" is resolved by the tool
+    params = service.verifier.ledger.get(info["verification"]["id"])["effective_params"]
+    assert params["window"] == info["window"] and params["window"]["source"] != "auto"
+    assert params["png_size"] == info["png_size"] and "png_resampling" in params
+
+    _, mpr = service.render_mpr([str(inbox / "axial")], plane="sagittal")
+    params = service.verifier.ledger.get(mpr["verification"]["id"])["effective_params"]
+    assert params["plane"] == "sagittal" and params["index"] == mpr["index"] and "nearest slice" in params["sampling"]
+
+
+def test_deidentify_record_holds_profile_key_id_validation_and_provenance(local, monkeypatch):
+    settings, inbox = local
+    service = DicomService(settings)
+    random_key = service.deidentify([str(inbox / "axial" / "slice000.dcm")])
+    record = service.verifier.ledger.get(random_key["verification"]["id"])
+    params = record["effective_params"]
+    assert params["key_id"] is None and params["linkable"] is False and params["date_mode"] == "shift"
+    assert any(p.startswith("113100 ") for p in params["profile"]) and any(p.startswith("113107 ") for p in params["profile"])
+    assert {"IDENTIFIERS_REMOVED", "UIDS_REMAPPED"} <= {c["code"] for c in record["checks"]}  # validation in the same record
+    source = str(inbox / "axial" / "slice000.dcm")
+    assert record["input_files"][source]["produced_by"] is None
+    assert record["input_files"][source]["transfer_syntax"]
+
+    monkeypatch.setenv(settings.deid_key_env, "test-secret")
+    first = service.deidentify([str(inbox / "axial" / "slice000.dcm")], date_mode="keep")
+    second = service.deidentify([str(inbox / "axial" / "slice000.dcm")], date_mode="keep")
+    assert first["key_id"] and first["key_id"] == second["key_id"] and "test-secret" not in first["key_id"]
+    assert any(p.startswith("113106 ") for p in first["profile"])
+
+    output = second["files"][0]["output"]
+    stats = service.pixel_statistics(output)
+    link = service.verifier.ledger.get(stats["verification"]["id"])["input_files"][output]
+    assert link["produced_by"] == second["verification"]["id"]
+
+
+def test_dimse_and_dicomweb_paths_are_distinguishable_in_the_ledger(settings, web):
+    from conftest import STUDY_UID
+
+    service = DicomService(settings, http_transport=web.transport())
+    dimse = service.retrieve("pacs", STUDY_UID)
+    service.store("web", dimse["files"])
+    dicomweb = service.retrieve("web", STUDY_UID)
+    ledger = service.verifier.ledger
+
+    a = ledger.get(dimse["verification"]["id"])["source"]
+    b = ledger.get(dicomweb["verification"]["id"])["source"]
+    assert (a["protocol"], a["operation"], a["calling_ae_title"]) == ("dimse", "C-GET", "DICOM_MCP")
+    assert a["endpoint"].startswith("FAKEPACS@127.0.0.1:")
+    assert (b["protocol"], b["operation"], b["endpoint"]) == ("dicomweb", "WADO-RS", "http://dicomweb.test/dicom-web")
+    assert b["requested_transfer_syntax"] == "*"
+    assert a["received_transfer_syntaxes"] and b["received_transfer_syntaxes"]
+
+    commit = ledger.get(ledger.records()[-2]["id"])
+    assert commit["kind"] == "commit" and commit["source"]["operation"] == "STOW-RS" and commit["source"]["sent_transfer_syntaxes"]
+
+    geometry = service.check_geometry(dicomweb["files"])
+    links = ledger.get(geometry["verification"]["id"])["input_files"]
+    assert {v["produced_by"] for v in links.values()} == {dicomweb["verification"]["id"]}
+
+
+def test_endpoint_never_records_credentials(tmp_path):
+    settings = Settings.model_validate({"storage_dir": str(tmp_path), "nodes": {
+        "w": {"protocol": "dicomweb", "base_url": "https://user:pw@dicom.example.org:8443/v2?code=secret"}}})
+    assert DicomService(settings)._source("w", "retrieve")["endpoint"] == "https://dicom.example.org:8443/v2"

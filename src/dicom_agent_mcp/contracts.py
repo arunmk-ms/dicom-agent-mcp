@@ -344,8 +344,8 @@ def store_gate(files: list[Path], ledger: Ledger) -> tuple[list[Check], dict[str
         checks += geometry_checks("store", imaging.analyze_series(uid, slices).issues, "gate", uid)
 
     index = _output_index(ledger)
-    digests = {str(f): file_sha256(f) for f in files}
-    prior = [index[d] for d in digests.values() if d in index]
+    provenance = input_provenance(files, ledger, index)
+    prior = [index[p["sha256"]] for p in provenance.values() if p["produced_by"]]
     verdict = worst(r["verdict"] for r in prior)
     evidence = {"files_with_prior_record": len(prior), "files": len(files), "records": sorted({r["id"] for r in prior})[:10]}
     if prior and verdict != PASS:
@@ -356,7 +356,7 @@ def store_gate(files: list[Path], ledger: Ledger) -> tuple[list[Check], dict[str
     if len(prior) < len(files):
         checks.append(Check("gate", "NO_PRIOR_RECORD", PASS, f"{len(files) - len(prior)} file(s) were not produced by a verified tool call.",
                             {"files": len(files) - len(prior)}))
-    return checks, {"file_digests": digests}
+    return checks, {"input_files": provenance}
 
 
 def _output_index(ledger: Ledger) -> dict[str, dict[str, Any]]:
@@ -365,6 +365,51 @@ def _output_index(ledger: Ledger) -> dict[str, dict[str, Any]]:
         for d in (record.get("output_files") or {}).values():
             index[d] = record  # the latest record that produced a file wins
     return index
+
+
+def input_provenance(files: Iterable[Path], ledger: Ledger, index: dict[str, dict[str, Any]] | None = None) -> dict[str, dict[str, Any]]:
+    """For each input file: its SHA-256, its transfer syntax and the ledger record that produced it (if any).
+
+    ``produced_by`` chains a pixel result back to the retrieve (C-GET or WADO-RS) or de-identification that wrote the file.
+    """
+    index = _output_index(ledger) if index is None else index
+    out: dict[str, dict[str, Any]] = {}
+    for f in files:
+        sha = file_sha256(Path(f))
+        producer = index.get(sha)
+        out[str(f)] = {"sha256": sha, "transfer_syntax": transfer_syntax(Path(f)), "produced_by": producer["id"] if producer else None}
+    return out
+
+
+def transfer_syntax(path: Path) -> str | None:
+    try:
+        meta = getattr(imaging.read_dataset(path, pixels=False), "file_meta", None)
+    except DicomMcpError:
+        return None
+    uid = meta.get("TransferSyntaxUID") if meta is not None else None
+    return str(uid) if uid else None
+
+
+# Values a tool resolved or applied (as opposed to what the caller asked for), keyed by tool.
+EFFECTIVE_KEYS: dict[str, tuple[str, ...]] = {
+    "render_image": ("frame", "window", "png_size"),
+    "render_mpr": ("series_uid", "plane", "index", "pixel_spacing_mm", "window", "png_size"),
+    "pixel_statistics": ("frame", "units", "roi", "roi_bounds_px", "pixel_spacing_source"),
+    "measure_distance": ("frame", "pixel_spacing_source"),
+    "deidentify": ("method", "profile", "date_mode", "linkable", "key_id", "keep_private", "keep_descriptions"),
+}
+FIXED_PARAMS: dict[str, dict[str, Any]] = {
+    "render_image": {"png_resampling": "lanczos when downscaling, bilinear when upscaling"},
+    "render_mpr": {"sampling": "nearest slice, no isotropic resampling", "png_resampling": "lanczos when downscaling, bilinear when upscaling"},
+}
+
+
+def effective_params(tool: str, info: Mapping[str, Any]) -> dict[str, Any] | None:
+    if tool not in EFFECTIVE_KEYS:
+        return None
+    out = {k: info[k] for k in EFFECTIVE_KEYS[tool] if k in info}
+    out.update(FIXED_PARAMS.get(tool, {}))
+    return out
 
 
 def store_post(result: Mapping[str, Any], sent_uids: set[str]) -> list[Check]:

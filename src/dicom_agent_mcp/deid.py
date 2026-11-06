@@ -48,6 +48,7 @@ EMPTY = ["PatientBirthDate", "ReferringPhysicianName", "AccessionNumber", "Study
 DESCRIPTIONS = ["StudyDescription", "SeriesDescription", "ProtocolName"]
 # Content that may carry identifiers inside the pixels.
 PIXEL_RISK_MODALITIES = {"US", "SC", "OT", "XC", "ES", "DOC", "SM"}
+METHOD = "dicom-agent-mcp basic profile"
 
 
 class Deidentifier:
@@ -105,21 +106,31 @@ class Deidentifier:
         ds.PatientID = f"ANON{pseudonym}"
         ds.PatientIdentityRemoved = "YES"
         ds.LongitudinalTemporalInformationModified = "MODIFIED" if self.date_mode == "shift" else "UNMODIFIED"
+        if self.keep_descriptions:
+            warnings.append("Study/series descriptions and protocol names were kept unreviewed.")
+        if self.keep_private:
+            warnings.append("Private tags were kept; they may contain identifiers.")
+        ds.DeidentificationMethod = METHOD
+        ds.DeidentificationMethodCodeSequence = Sequence([_code(v, m) for v, m in self.profile_codes()])
+        if "SOPInstanceUID" in ds and hasattr(ds, "file_meta"):
+            ds.file_meta.MediaStorageSOPInstanceUID = ds.SOPInstanceUID
+        return warnings
+
+    def profile_codes(self) -> list[tuple[str, str]]:
+        """The Basic Profile and options applied (CID 7050 codes), as written to DeidentificationMethodCodeSequence."""
         codes = [("113100", "Basic Application Confidentiality Profile"), ("113108", "Retain Patient Characteristics Option")]
         if self.date_mode == "shift":
             codes.append(("113107", "Retain Longitudinal Temporal Information Modified Dates Option"))
         else:
             codes.append(("113106", "Retain Longitudinal Temporal Information Full Dates Option"))
-        if self.keep_descriptions:
-            warnings.append("Study/series descriptions and protocol names were kept unreviewed.")
         if self.keep_private:
-            warnings.append("Private tags were kept; they may contain identifiers.")
             codes.append(("113111", "Retain Safe Private Option"))
-        ds.DeidentificationMethod = "dicom-agent-mcp basic profile"
-        ds.DeidentificationMethodCodeSequence = Sequence([_code(v, m) for v, m in codes])
-        if "SOPInstanceUID" in ds and hasattr(ds, "file_meta"):
-            ds.file_meta.MediaStorageSOPInstanceUID = ds.SOPInstanceUID
-        return warnings
+        return codes
+
+    @property
+    def key_id(self) -> str | None:
+        """A one-way identifier of the configured key, so runs with the same key can be matched. None for random keys."""
+        return f"hmac-sha256:{self._digest('key-id')[:16]}" if self.linkable else None
 
     def _map_uids(self, value: Any) -> Any:
         if isinstance(value, (list, tuple)) or (hasattr(value, "__iter__") and not isinstance(value, str)):
@@ -173,6 +184,8 @@ def deidentify_files(files: list[Path], output_root: Path, deidentifier: Deident
     return {
         "count": len(outputs), "output_dir": str(output_root), "files": outputs,
         "linkable": deidentifier.linkable, "date_mode": deidentifier.date_mode,
+        "method": METHOD, "profile": [f"{v} {m}" for v, m in deidentifier.profile_codes()], "key_id": deidentifier.key_id,
+        "keep_private": deidentifier.keep_private, "keep_descriptions": deidentifier.keep_descriptions,
         "warnings": sorted(warnings),
         "note": "Basic-profile subset; pixel data is not scrubbed. Review before sharing outside your organization.",
     }
