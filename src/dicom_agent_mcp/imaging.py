@@ -431,6 +431,11 @@ def measure_distance(ds: Dataset, start: tuple[float, float], end: tuple[float, 
             out["warning"] = "Distance uses detector-plane spacing; true anatomical size may differ (magnification)."
     else:
         out["warning"] = "The image has no pixel spacing; only the pixel distance is available."
+    if "PixelData" in ds:
+        try:
+            out["input_fingerprint"] = pixel_fingerprint(stored_frame(ds, frame), geo)
+        except DicomMcpError:
+            pass  # pixels cannot be decoded here; the measurement itself only needs the header
     return out
 
 

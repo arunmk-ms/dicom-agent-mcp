@@ -11,6 +11,7 @@ EXPECTED_TOOLS = {
     "list_nodes", "echo", "search", "get_metadata", "retrieve", "move",
     "store", "transfer", "list_local_files", "read_local_metadata",
     "render_image", "pixel_statistics", "measure_distance", "check_geometry", "render_mpr", "deidentify",
+    "verify_claim", "get_verification",
 }
 
 

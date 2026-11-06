@@ -9,6 +9,7 @@ allowed_paths: []               # Extra directories the store/read_local_metadat
 max_results: 500                # Upper bound for search/get_metadata limits.
 max_volume_voxels: 100000000    # render_mpr refuses larger series.
 deid_key_env: DICOM_AGENT_MCP_DEID_KEY  # Env var holding the secret for stable pseudonyms; never put the key here.
+verification: advisory          # TEVL policy: off | advisory (record verdicts) | enforce (block HARD_FAIL; gate SOFT_FAIL on store).
 
 timeouts:                       # Seconds.
   acse: 30

@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 from pydicom import dcmread
 from pydicom.errors import InvalidDicomError
 
-from . import imaging
+from . import contracts, imaging
 from .config import DicomWebNode, DimseNode, Settings
 from .deid import Deidentifier, deidentify_files
 from .datasets import (
@@ -25,8 +26,10 @@ from .datasets import (
 from .dicomweb import DicomWebClient
 from .dimse import DimseClient
 from .errors import DicomMcpError
+from .verification import HARD_FAIL, PASS, SOFT_FAIL, Check, VerificationError, Verifier, digest, file_sha256, overall, summary, worst
 
 MAX_STORE_FILES = 10_000
+CLAIM_TOOLS = ("pixel_statistics", "measure_distance", "check_geometry")
 METADATA_FIELDS = DEFAULT_RETURN_KEYS[Level.IMAGE] + [
     "Modality", "SeriesNumber", "SeriesDescription", "ImageType", "Rows", "Columns",
     "NumberOfFrames", "PixelSpacing", "SliceThickness", "ImagePositionPatient",
@@ -38,6 +41,144 @@ class DicomService:
     def __init__(self, settings: Settings, http_transport: httpx.BaseTransport | None = None):
         self.settings = settings
         self.http_transport = http_transport
+        self.verifier = Verifier(settings.verification, settings.ledger_path)
+
+    # ---- verification ------------------------------------------------------------------------
+
+    def _verified(
+        self,
+        tool: str,
+        args: Mapping[str, Any],
+        run: Callable[[dict[str, Any]], Any],
+        *,
+        setup: Callable[[dict[str, Any]], None] | None = None,
+        pre: Callable[[dict[str, Any]], list[Check]] | None = None,
+        post: Callable[[dict[str, Any], Any], Any] | None = None,
+    ) -> Any:
+        """Run a tool under its contract: preconditions, the tool, postconditions, one ledger record.
+
+        ``ctx`` is a scratch dict shared by setup/pre/run/post so inputs are read once. Results that are
+        (png, info) tuples get the verification block on ``info``.
+        """
+        ctx: dict[str, Any] = {"record": {}}
+        if not self.verifier.enabled:
+            if setup:
+                setup(ctx)
+            return run(ctx)
+        checks: list[Check] = []
+        try:
+            if setup:
+                setup(ctx)
+            checks = list(pre(ctx)) if pre else []
+            if self.verifier.blocks(overall(checks), commit=False, accept_soft_fail=False):
+                self.verifier.block(tool, args, checks, commit=False, **ctx["record"])
+            result = run(ctx)
+            extra: dict[str, Any] = {}
+            if post:
+                out = post(ctx, result)
+                if isinstance(out, tuple):
+                    out, extra = out
+                checks += out
+        except VerificationError:
+            raise
+        except DicomMcpError as exc:
+            self.verifier.record(tool, "tool", args, [*checks, Check("post", "TOOL_ERROR", HARD_FAIL, str(exc))], **ctx.get("record", {}))
+            raise
+        info = result[1] if isinstance(result, tuple) else result
+        fingerprints = extra.pop("input_fingerprints", None)
+        if fingerprints is None:
+            fingerprints = [info["input_fingerprint"]] if info.get("input_fingerprint") else []
+        output = digest(info, result[0] if isinstance(result, tuple) else None)
+        provenance: dict[str, Any] = {}
+        params = contracts.effective_params(tool, info)
+        if params is not None:
+            provenance["effective_params"] = params
+        if ctx.get("inputs"):
+            provenance["input_files"] = contracts.input_provenance(ctx["inputs"], self.verifier.ledger)
+        record = self.verifier.record(tool, "tool", args, checks, input_fingerprints=fingerprints, output_digest=output,
+                                      **provenance, **ctx.get("record", {}), **extra)
+        info["verification"] = summary(record)
+        return result
+
+    def verify_claim(
+        self,
+        tool: str,
+        arguments: Mapping[str, Any],
+        claimed: Mapping[str, Any],
+        input_fingerprint: str | None = None,
+        tolerance: float | None = None,
+    ) -> dict[str, Any]:
+        """Recompute a tool result independently and compare the claimed fields with it."""
+        if tool not in CLAIM_TOOLS:
+            raise DicomMcpError(f"verify_claim supports {', '.join(CLAIM_TOOLS)}; got '{tool}'.")
+        if not claimed:
+            raise DicomMcpError("claimed must name at least one field, e.g. {\"mean\": 41.2}.")
+        if tolerance is not None and tolerance < 0:
+            raise DicomMcpError("tolerance must not be negative.")
+        args = dict(arguments)
+        try:
+            if tool == "pixel_statistics":
+                actual = self._statistics_raw(args["path"], int(args.get("frame", 0)), args.get("roi"))
+            elif tool == "measure_distance":
+                actual = self._distance_raw(args["path"], args["start"], args["end"], int(args.get("frame", 0)))
+            else:
+                actual = self._geometry_raw(args["paths"])[0]
+        except KeyError as exc:
+            raise DicomMcpError(f"arguments for {tool} are missing {exc}.") from exc
+        except TypeError as exc:
+            raise DicomMcpError(f"Invalid arguments for {tool}: {exc}.") from exc
+
+        checks: list[Check] = []
+        if input_fingerprint:
+            recomputed = actual.get("input_fingerprint")
+            if recomputed is None:
+                checks.append(Check("pre", "FINGERPRINT_UNAVAILABLE", SOFT_FAIL, f"{tool} results carry no input fingerprint to compare."))
+            elif recomputed != input_fingerprint:
+                checks.append(Check("pre", "FINGERPRINT_MISMATCH", HARD_FAIL,
+                                    "The pixels at this path differ from the ones the claim was computed on.",
+                                    {"claimed": input_fingerprint, "actual": recomputed}))
+            else:
+                checks.append(Check("pre", "FINGERPRINT_MATCH", PASS, "The claim was computed on these pixels."))
+        fields = []
+        for path, value in claimed.items():
+            found, recomputed = contracts.lookup(actual, path)
+            if not found:
+                checks.append(Check("post", "UNKNOWN_FIELD", HARD_FAIL, f"'{path}' is not a field of the {tool} result."))
+                fields.append({"field": path, "claimed": value, "verdict": HARD_FAIL})
+                continue
+            ok, tol = contracts.compare_claim(value, recomputed, tolerance)
+            entry = {"field": path, "claimed": value, "actual": recomputed, "verdict": PASS if ok else HARD_FAIL}
+            if tol is not None:
+                entry["tolerance"] = tol
+            fields.append(entry)
+            checks.append(Check("post", "CLAIM_MATCH" if ok else "CLAIM_MISMATCH", entry["verdict"],
+                                f"{path}: claimed {value!r}, recomputed {recomputed!r}" + (f" (tolerance {tol:g})" if tol is not None else "") + "."))
+        out: dict[str, Any] = {"tool": tool, "verdict": overall(checks), "fields": fields}
+        if actual.get("input_fingerprint"):
+            out["input_fingerprint"] = actual["input_fingerprint"]
+        if self.verifier.enabled:
+            fps = [actual["input_fingerprint"]] if actual.get("input_fingerprint") else []
+            record = self.verifier.record(tool, "claim", {"arguments": args, "claimed": dict(claimed), "tolerance": tolerance}, checks,
+                                          input_fingerprints=fps)
+            out["verification"] = summary(record)
+        return out
+
+    def get_verification(self, record_id: str | None = None, fingerprint: str | None = None, limit: int = 20) -> dict[str, Any]:
+        ledger = self.verifier.ledger
+        limit = max(1, min(limit, self.settings.max_results))
+        if record_id:
+            record = ledger.get(record_id)
+            if record is None:
+                raise DicomMcpError(f"No verification record '{record_id}' in {ledger.path}.")
+            records = [record]
+        elif fingerprint:
+            records = ledger.find(fingerprint=fingerprint) or ledger.find(file_digest=fingerprint)
+        else:
+            records = ledger.records()
+        return {
+            "policy": self.verifier.policy, "ledger": str(ledger.path), "integrity": ledger.check_chain(),
+            "count": len(records), "truncated": len(records) > limit, "records": records[-limit:],
+        }
 
     # ---- nodes -------------------------------------------------------------------------------
 
@@ -57,6 +198,22 @@ class DicomService:
         if self._node(name).read_only:
             raise DicomMcpError(f"Node '{name}' is configured as read-only.")
         return self._client(name)
+
+    _OPERATIONS = {"retrieve": ("C-GET", "WADO-RS"), "move": ("C-MOVE", None), "store": ("C-STORE", "STOW-RS")}
+
+    def _source(self, name: str, tool: str) -> dict[str, Any]:
+        """Which protocol path a network tool used, so DIMSE and DICOMweb runs can be compared from the ledger."""
+        node = self.settings.nodes.get(name)
+        if node is None:
+            return {"node": name}
+        dimse_op, web_op = self._OPERATIONS[tool]
+        if isinstance(node, DimseNode):
+            return {"node": name, "protocol": "dimse", "operation": dimse_op,
+                    "endpoint": f"{node.ae_title}@{node.host}:{node.port}", "calling_ae_title": self.settings.calling_ae_title}
+        url = urlsplit(node.base_url)
+        endpoint = urlunsplit((url.scheme, url.hostname + (f":{url.port}" if url.port else "") if url.hostname else url.netloc, url.path, "", ""))
+        return {"node": name, "protocol": "dicomweb", "operation": web_op, "endpoint": endpoint,
+                "requested_transfer_syntax": node.transfer_syntax}
 
     def list_nodes(self) -> list[dict[str, Any]]:
         out = []
@@ -99,10 +256,23 @@ class DicomService:
             found, truncated = client.search(lvl, qido_params(filters, keys), limit, offset)
             operation = "QIDO-RS"
         results = [{k: v for k, v in to_friendly(ds).items() if k != "QueryRetrieveLevel"} for ds in found]
-        return {
+        out: dict[str, Any] = {
             "node": node, "operation": operation, "level": lvl.value,
+            "status": "truncated" if truncated else ("ok" if results else "empty"),
             "count": len(results), "offset": offset, "truncated": truncated, "results": results,
         }
+        if not results:
+            protocol = "dimse" if operation == "C-FIND" else "qido"
+            out["query"] = {"level": lvl.value, "filters": filters, "return_fields": return_fields or []}
+            unsupported = contracts.optional_keys(protocol, lvl, filters)
+            if unsupported:
+                out["possibly_unsupported_keys"] = unsupported
+            out["hint"] = (
+                "No matches. An empty result is not proof that nothing exists: check wildcards (e.g. 'SMITH*'), "
+                "date ranges ('20240101-20241231'), the level"
+                + (", and keys the archive may not index (see possibly_unsupported_keys)." if unsupported else ".")
+            )
+        return out
 
     def get_metadata(
         self,
@@ -146,52 +316,127 @@ class DicomService:
     # ---- retrieve / move / store -------------------------------------------------------------
 
     def retrieve(self, node: str, study_uid: str, series_uid: str | None = None, sop_instance_uid: str | None = None) -> dict[str, Any]:
-        dest = self.settings.storage_dir
-        dest.mkdir(parents=True, exist_ok=True)
-        client = self._client(node)
-        if isinstance(client, DimseClient):
-            level, identifier = _retrieve_identifier(study_uid, series_uid, sop_instance_uid)
-            result = client.get(level, identifier, dest)
-        else:
-            result = client.retrieve(study_uid, series_uid, sop_instance_uid, dest)
-        return {"node": node, "storage_dir": str(dest), **result}
+        args = {"node": node, "study_uid": study_uid, "series_uid": series_uid, "sop_instance_uid": sop_instance_uid}
+
+        def run(_: dict[str, Any]) -> dict[str, Any]:
+            dest = self.settings.storage_dir
+            dest.mkdir(parents=True, exist_ok=True)
+            client = self._client(node)
+            if isinstance(client, DimseClient):
+                level, identifier = _retrieve_identifier(study_uid, series_uid, sop_instance_uid)
+                result = client.get(level, identifier, dest)
+            else:
+                result = client.retrieve(study_uid, series_uid, sop_instance_uid, dest)
+            errors = result.get("save_errors") or []
+            failed = max(int(result.get("failed", 0) or 0), len(errors))
+            items = [{"sop_instance_uid": u} for u in result.get("failed_sop_instance_uids", [])] + [{"error": e} for e in errors]
+            out = {"node": node, "storage_dir": str(dest), **_with_outcome(result, _outcome(len(result["files"]), failed, result.get("ok", True)))}
+            if items:
+                out["failed_items"] = items
+            return out
+
+        def post(ctx: dict[str, Any], result: dict[str, Any]) -> tuple[list[Check], dict[str, Any]]:
+            checks = contracts.retrieve_post(result, study_uid, series_uid, sop_instance_uid)
+            files = [Path(f) for f in result["files"]]
+            ctx["record"]["source"]["received_transfer_syntaxes"] = sorted({ts for f in files if (ts := contracts.transfer_syntax(f))})
+            return checks, {"output_files": {str(f): file_sha256(f) for f in files}}
+
+        return self._verified("retrieve", args, run, setup=lambda ctx: ctx["record"].update(source=self._source(node, "retrieve")), post=post)
 
     def move(
         self, node: str, destination: str, study_uid: str, series_uid: str | None = None, sop_instance_uid: str | None = None
     ) -> dict[str, Any]:
-        client = self._client(node)
-        if not isinstance(client, DimseClient):
-            raise DicomMcpError("C-MOVE is a DIMSE operation. For DICOMweb nodes use the 'transfer' tool instead.")
-        dest_node = self.settings.nodes.get(destination)
-        if dest_node is not None:
-            if not isinstance(dest_node, DimseNode):
-                raise DicomMcpError(f"Destination '{destination}' is a DICOMweb node; use the 'transfer' tool instead.")
-            if dest_node.read_only:
-                raise DicomMcpError(f"Destination '{destination}' is configured as read-only.")
-            destination_aet = dest_node.ae_title
-        else:
-            destination_aet = destination  # A raw AE title the source archive already knows.
-        level, identifier = _retrieve_identifier(study_uid, series_uid, sop_instance_uid)
-        return {"node": node, **client.move(level, identifier, destination_aet)}
+        args = {"node": node, "destination": destination, "study_uid": study_uid, "series_uid": series_uid, "sop_instance_uid": sop_instance_uid}
 
-    def store(self, node: str, paths: list[str]) -> dict[str, Any]:
-        client = self._writable(node)
-        files, skipped = self._collect_dicom_files(paths)
-        if not files:
-            raise DicomMcpError("No DICOM files found to store." + (f" Skipped: {skipped[:5]}" if skipped else ""))
-        result = client.store(files)
-        return {"node": node, "skipped": skipped, **result}
+        def run(_: dict[str, Any]) -> dict[str, Any]:
+            client = self._client(node)
+            if not isinstance(client, DimseClient):
+                raise DicomMcpError("C-MOVE is a DIMSE operation. For DICOMweb nodes use the 'transfer' tool instead.")
+            dest_node = self.settings.nodes.get(destination)
+            if dest_node is not None:
+                if not isinstance(dest_node, DimseNode):
+                    raise DicomMcpError(f"Destination '{destination}' is a DICOMweb node; use the 'transfer' tool instead.")
+                if dest_node.read_only:
+                    raise DicomMcpError(f"Destination '{destination}' is configured as read-only.")
+                destination_aet = dest_node.ae_title
+            else:
+                destination_aet = destination  # A raw AE title the source archive already knows.
+            level, identifier = _retrieve_identifier(study_uid, series_uid, sop_instance_uid)
+            result = client.move(level, identifier, destination_aet)
+            out = {"node": node, **_with_outcome(result, _outcome(result.get("completed", 0), result.get("failed", 0), result["ok"]))}
+            if result.get("failed_sop_instance_uids"):
+                out["failed_items"] = [{"sop_instance_uid": u} for u in result["failed_sop_instance_uids"]]
+            return out
+
+        return self._verified("move", args, run, setup=lambda ctx: ctx["record"].update(source={**self._source(node, "move"), "destination": destination}),
+                              post=lambda _, r: contracts.move_post(r))
+
+    def store(self, node: str, paths: list[str], accept_soft_fail: bool = False) -> dict[str, Any]:
+        """Send files to an archive. Under TEVL the gate verdict is written to the ledger before anything is sent."""
+        args = {"node": node, "paths": list(paths), "accept_soft_fail": accept_soft_fail}
+        gate: dict[str, Any] | None = None
+        try:
+            client = self._writable(node)
+            files, skipped = self._collect_dicom_files(paths)
+            if not files:
+                raise DicomMcpError("No DICOM files found to store." + (f" Skipped: {skipped[:5]}" if skipped else ""))
+            if self.verifier.enabled:
+                checks, extra = contracts.store_gate(files, self.verifier.ledger)
+                extra["source"] = {**self._source(node, "store"),
+                                   "sent_transfer_syntaxes": sorted({p["transfer_syntax"] for p in extra["input_files"].values() if p["transfer_syntax"]})}
+                verdict = overall(checks)
+                if self.verifier.blocks(verdict, commit=True, accept_soft_fail=accept_soft_fail):
+                    self.verifier.block("store", args, checks, commit=True, **extra)
+                gate = self.verifier.record("store", "gate", args, checks, accepted_soft_fail=accept_soft_fail and verdict == SOFT_FAIL, **extra)
+            sent = {str(dcmread(f, stop_before_pixels=True).get("SOPInstanceUID", "")) for f in files}
+            result = client.store(files)
+        except VerificationError:
+            raise
+        except DicomMcpError as exc:
+            if self.verifier.enabled:
+                extra_ids = {"gate_id": gate["id"], "source": gate["source"]} if gate else {}
+                self.verifier.record("store", "commit", args, [Check("post", "TOOL_ERROR", HARD_FAIL, str(exc))], **extra_ids)
+            raise
+        out: dict[str, Any] = {"node": node, "skipped": skipped, **_with_outcome(result, _outcome(result["stored"], result["failed"]))}
+        items = [{"path": r["path"], "sop_instance_uid": r["sop_instance_uid"], "reason": r.get("error") or r.get("status")}
+                 for r in result.get("results", []) if not r.get("ok")]
+        items += list(result.get("failures", []))
+        if items:
+            out["failed_items"] = items
+        if gate is not None:
+            record = self.verifier.record(
+                "store", "commit", args, contracts.store_post(out, sent),
+                gate_id=gate["id"], gate_verdict=gate["verdict"], accepted_soft_fail=gate["accepted_soft_fail"],
+                source=gate["source"], output_digest=digest(out),
+            )
+            out["verification"] = summary(record)
+        return out
 
     def transfer(
-        self, source: str, destination: str, study_uid: str, series_uid: str | None = None, sop_instance_uid: str | None = None
+        self,
+        source: str,
+        destination: str,
+        study_uid: str,
+        series_uid: str | None = None,
+        sop_instance_uid: str | None = None,
+        accept_soft_fail: bool = False,
     ) -> dict[str, Any]:
         """Copy data between any two nodes (DIMSE or DICOMweb) through the local cache."""
         self._writable(destination)
         retrieved = self.retrieve(source, study_uid, series_uid, sop_instance_uid)
+        out: dict[str, Any] = {"source": source, "destination": destination}
         if not retrieved["files"]:
-            raise DicomMcpError(f"Nothing was retrieved from '{source}'; nothing to transfer.")
-        stored = self.store(destination, retrieved["files"])
-        return {"source": source, "destination": destination, "retrieve": retrieved, "store": stored}
+            out.update(status="empty" if retrieved["status"] == "empty" else "failed", retrieve=retrieved, store=None,
+                       message=f"Nothing was retrieved from '{source}'; nothing was sent to '{destination}'.")
+        else:
+            stored = self.store(destination, retrieved["files"], accept_soft_fail)
+            statuses = {retrieved["status"], stored["status"]}
+            status = "failed" if stored["status"] == "failed" else "partial" if statuses & {"partial", "failed"} else "ok"
+            out.update(status=status, retrieve=retrieved, store=stored)
+        parts = [r["verification"] for r in (out["retrieve"], out["store"]) if r and "verification" in r]
+        if parts:
+            out["verification"] = {"verdict": worst(p["verdict"] for p in parts), "policy": self.verifier.policy, "records": [p["id"] for p in parts]}
+        return out
 
     # ---- pixels and geometry ------------------------------------------------------------------
 
@@ -204,32 +449,89 @@ class DicomService:
         window_width: float | None = None,
         max_size: int = 512,
     ) -> tuple[bytes, dict[str, Any]]:
+        args = {"path": path, "frame": frame, "window": window, "window_center": window_center, "window_width": window_width, "max_size": max_size}
+
+        def setup(ctx: dict[str, Any]) -> None:
+            ctx["file"] = self._check_file(path)
+            ctx["inputs"] = [ctx["file"]]
+            ctx["ds"] = imaging.read_dataset(ctx["file"])
+
+        def run(ctx: dict[str, Any]) -> tuple[bytes, dict[str, Any]]:
+            png, info = imaging.render_frame(ctx["ds"], frame, window, window_center, window_width, max_size)
+            return png, {"path": str(ctx["file"]), **info, "png_path": self._save_png(png, f"{ctx['file'].stem}_f{frame}", info)}
+
+        def post(ctx: dict[str, Any], result: tuple[bytes, dict[str, Any]]) -> list[Check]:
+            info, geo = result[1], imaging.geometry(ctx["ds"], frame)
+            return contracts.aspect_checks((geo.rows, geo.columns), geo.spacing, info["png_size"], max_size) + contracts.window_checks(info["window"])
+
+        return self._verified("render_image", args, run, setup=setup,
+                              pre=lambda ctx: contracts.render_pre(ctx["ds"], frame, window, window_center, window_width), post=post)
+
+    def _statistics_inputs(self, path: str, roi: Mapping[str, Any] | None) -> tuple[Path, Any, imaging.Roi | None]:
         file = self._check_file(path)
-        png, info = imaging.render_frame(imaging.read_dataset(file), frame, window, window_center, window_width, max_size)
-        return png, {"path": str(file), **info, "png_path": self._save_png(png, f"{file.stem}_f{frame}", info)}
+        try:
+            region = imaging.Roi(**roi) if roi else None
+        except TypeError as exc:
+            raise DicomMcpError(f"Invalid roi: {exc}.") from exc
+        return file, imaging.read_dataset(file), region
+
+    def _statistics_raw(self, path: str, frame: int = 0, roi: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        file, ds, region = self._statistics_inputs(path, roi)
+        return {"path": str(file), **imaging.pixel_statistics(ds, frame, region)}
 
     def pixel_statistics(self, path: str, frame: int = 0, roi: Mapping[str, Any] | None = None) -> dict[str, Any]:
-        file = self._check_file(path)
-        region = imaging.Roi(**roi) if roi else None
-        return {"path": str(file), **imaging.pixel_statistics(imaging.read_dataset(file), frame, region)}
+        args = {"path": path, "frame": frame, "roi": dict(roi) if roi else None}
 
-    def measure_distance(self, path: str, start: list[float], end: list[float], frame: int = 0) -> dict[str, Any]:
+        def setup(ctx: dict[str, Any]) -> None:
+            ctx["file"], ctx["ds"], ctx["roi"] = self._statistics_inputs(path, roi)
+            ctx["inputs"] = [ctx["file"]]
+
+        def run(ctx: dict[str, Any]) -> dict[str, Any]:
+            return {"path": str(ctx["file"]), **imaging.pixel_statistics(ctx["ds"], frame, ctx["roi"])}
+
+        return self._verified(
+            "pixel_statistics", args, run, setup=setup,
+            pre=lambda ctx: contracts.statistics_pre(ctx["ds"], frame, ctx["roi"]),
+            post=lambda ctx, r: contracts.statistics_post(r, ctx["ds"], frame, ctx["roi"]),
+        )
+
+    def _distance_inputs(self, path: str, start: list[float], end: list[float]) -> tuple[Path, Any]:
         file = self._check_file(path)
         if len(start) != 2 or len(end) != 2:
             raise DicomMcpError("start and end must be [row, column] pairs.")
-        ds = imaging.read_dataset(file, pixels=False)
+        return file, imaging.read_dataset(file)
+
+    def _distance_raw(self, path: str, start: list[float], end: list[float], frame: int = 0) -> dict[str, Any]:
+        file, ds = self._distance_inputs(path, start, end)
         return {"path": str(file), **imaging.measure_distance(ds, (start[0], start[1]), (end[0], end[1]), frame)}
 
-    def check_geometry(self, paths: list[str]) -> dict[str, Any]:
+    def measure_distance(self, path: str, start: list[float], end: list[float], frame: int = 0) -> dict[str, Any]:
+        args = {"path": path, "start": list(start), "end": list(end), "frame": frame}
+
+        def setup(ctx: dict[str, Any]) -> None:
+            ctx["file"], ctx["ds"] = self._distance_inputs(path, start, end)
+            ctx["inputs"] = [ctx["file"]]
+
+        def run(ctx: dict[str, Any]) -> dict[str, Any]:
+            return {"path": str(ctx["file"]), **imaging.measure_distance(ctx["ds"], (start[0], start[1]), (end[0], end[1]), frame)}
+
+        return self._verified("measure_distance", args, run, setup=setup,
+                              pre=lambda ctx: contracts.distance_pre(ctx["ds"], frame), post=lambda _, r: contracts.distance_post(r))
+
+    def _geometry_raw(self, paths: list[str]) -> tuple[dict[str, Any], list[imaging.SeriesReport], list[Path]]:
         files, skipped = self._collect_dicom_files(paths)
         if not files:
             raise DicomMcpError("No DICOM files found.")
         reports = [imaging.analyze_series(uid, slices) for uid, slices in imaging.group_series(files).items()]
-        return {
-            "ok": not any(r.errors for r in reports),
-            "series": [r.to_dict() for r in reports],
-            "skipped": skipped,
-        }
+        result = {"ok": not any(r.errors for r in reports), "series": [r.to_dict() for r in reports], "skipped": skipped}
+        return result, reports, files
+
+    def check_geometry(self, paths: list[str]) -> dict[str, Any]:
+        def run(ctx: dict[str, Any]) -> dict[str, Any]:
+            result, ctx["reports"], ctx["inputs"] = self._geometry_raw(paths)
+            return result
+
+        return self._verified("check_geometry", {"paths": list(paths)}, run, post=lambda ctx, _: contracts.geometry_post(ctx["reports"]))
 
     def render_mpr(
         self,
@@ -242,43 +544,67 @@ class DicomService:
         window_width: float | None = None,
         max_size: int = 512,
     ) -> tuple[bytes, dict[str, Any]]:
-        files, _ = self._collect_dicom_files(paths)
-        groups = imaging.group_series(files)
-        if series_uid:
-            if series_uid not in groups:
-                raise DicomMcpError(f"Series {series_uid} is not among the given files.")
-            groups = {series_uid: groups[series_uid]}
-        elif len(groups) != 1:
-            raise DicomMcpError(f"The files contain {len(groups)} series; pass series_uid to pick one: {', '.join(groups)}.")
-        uid, slices = next(iter(groups.items()))
-        volume = imaging.load_volume(imaging.analyze_series(uid, slices), self.settings.max_volume_voxels)
-        image, info = imaging.reformat(volume, plane, index)  # type: ignore[arg-type]
-        header = slices[0].header
-        c, w, source = imaging.resolve_window(header, image, window, window_center, window_width)
-        pixels = imaging.apply_window(image, c, w)
-        if header.get("PhotometricInterpretation") == "MONOCHROME1":
-            pixels = 255 - pixels
-        png, size = imaging.to_png(pixels, tuple(info["pixel_spacing_mm"]), max_size)
-        info = {
-            "series_uid": uid, **info,
-            "window": {"center": c, "width": w, "source": source, "units": volume.units},
-            "png_size": list(size), "input_fingerprint": volume.fingerprint,
-        }
-        info["png_path"] = self._save_png(png, f"mpr_{plane}_{info['index']}", info)
-        return png, info
+        args = {"paths": list(paths), "plane": plane, "index": index, "series_uid": series_uid, "window": window,
+                "window_center": window_center, "window_width": window_width, "max_size": max_size}
+
+        def setup(ctx: dict[str, Any]) -> None:
+            files, _ = self._collect_dicom_files(paths)
+            groups = imaging.group_series(files)
+            if series_uid:
+                if series_uid not in groups:
+                    raise DicomMcpError(f"Series {series_uid} is not among the given files.")
+                groups = {series_uid: groups[series_uid]}
+            elif len(groups) != 1:
+                raise DicomMcpError(f"The files contain {len(groups)} series; pass series_uid to pick one: {', '.join(groups)}.")
+            uid, slices = next(iter(groups.items()))
+            ctx.update(uid=uid, slices=slices, report=imaging.analyze_series(uid, slices), inputs=[s.path for s in slices])
+
+        def run(ctx: dict[str, Any]) -> tuple[bytes, dict[str, Any]]:
+            uid, slices = ctx["uid"], ctx["slices"]
+            volume = imaging.load_volume(ctx["report"], self.settings.max_volume_voxels)
+            image, info = imaging.reformat(volume, plane, index)  # type: ignore[arg-type]
+            ctx["shape"] = image.shape
+            header = slices[0].header
+            c, w, source = imaging.resolve_window(header, image, window, window_center, window_width)
+            pixels = imaging.apply_window(image, c, w)
+            if header.get("PhotometricInterpretation") == "MONOCHROME1":
+                pixels = 255 - pixels
+            png, size = imaging.to_png(pixels, tuple(info["pixel_spacing_mm"]), max_size)
+            info = {
+                "series_uid": uid, **info,
+                "window": {"center": c, "width": w, "source": source, "units": volume.units},
+                "png_size": list(size), "input_fingerprint": volume.fingerprint,
+            }
+            info["png_path"] = self._save_png(png, f"mpr_{plane}_{info['index']}", info)
+            return png, info
+
+        def post(ctx: dict[str, Any], result: tuple[bytes, dict[str, Any]]) -> list[Check]:
+            info = result[1]
+            return contracts.aspect_checks(ctx["shape"], info["pixel_spacing_mm"], info["png_size"], max_size) + contracts.window_checks(info["window"])
+
+        return self._verified(
+            "render_mpr", args, run, setup=setup,
+            pre=lambda ctx: contracts.geometry_checks("render_mpr", ctx["report"].issues, "pre", ctx["uid"]), post=post,
+        )
 
     def deidentify(
         self, paths: list[str], date_mode: str = "shift", keep_descriptions: bool = False, keep_private: bool = False
     ) -> dict[str, Any]:
-        if date_mode not in ("shift", "keep"):
-            raise DicomMcpError("date_mode must be 'shift' or 'keep'.")
-        files, skipped = self._collect_dicom_files(paths)
-        if not files:
-            raise DicomMcpError("No DICOM files found to de-identify.")
-        key = os.environ.get(self.settings.deid_key_env)
-        deidentifier = Deidentifier(key.encode() if key else None, date_mode, keep_descriptions, keep_private)  # type: ignore[arg-type]
-        result = deidentify_files(files, self.settings.storage_dir / "deidentified", deidentifier)
-        return {**result, "skipped": skipped}
+        args = {"paths": list(paths), "date_mode": date_mode, "keep_descriptions": keep_descriptions, "keep_private": keep_private}
+
+        def run(ctx: dict[str, Any]) -> dict[str, Any]:
+            if date_mode not in ("shift", "keep"):
+                raise DicomMcpError("date_mode must be 'shift' or 'keep'.")
+            files, skipped = self._collect_dicom_files(paths)
+            if not files:
+                raise DicomMcpError("No DICOM files found to de-identify.")
+            ctx["inputs"] = files
+            key = os.environ.get(self.settings.deid_key_env)
+            deidentifier = Deidentifier(key.encode() if key else None, date_mode, keep_descriptions, keep_private)  # type: ignore[arg-type]
+            result = deidentify_files(files, self.settings.storage_dir / "deidentified", deidentifier)
+            return {**result, "skipped": skipped}
+
+        return self._verified("deidentify", args, run, post=lambda _, r: contracts.deidentify_post(r, keep_private, keep_descriptions))
 
     def _check_file(self, path: str) -> Path:
         file = self._check_path(path)
@@ -343,6 +669,22 @@ class DicomService:
                 except (InvalidDicomError, OSError):
                     skipped.append(str(candidate))
         return files, skipped
+
+
+def _with_outcome(result: dict[str, Any], status: str) -> dict[str, Any]:
+    """Put the explicit result state in ``status``; the protocol's own status text moves to ``protocol_status``."""
+    out = dict(result)
+    if "status" in out:
+        out["protocol_status"] = out.pop("status")
+    out["status"] = status
+    return out
+
+
+def _outcome(done: int, failed: int, ok: bool = True) -> str:
+    """Explicit result state for retrieve/move/store: ok, empty, partial or failed."""
+    if done == 0:
+        return "failed" if failed or not ok else "empty"
+    return "partial" if failed or not ok else "ok"
 
 
 def _retrieve_identifier(study_uid: str, series_uid: str | None, sop_instance_uid: str | None):
